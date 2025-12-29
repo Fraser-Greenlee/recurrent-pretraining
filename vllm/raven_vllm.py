@@ -1,14 +1,17 @@
 # type: ignore
 """vLLM-compatible Huginn-3.5B model implementation.
 
-The reference HF implementation can be found in litgpt/raven_modeling_minimal.py
+This implementation adapts the compute-adaptive architecture of the Huginn-3.5B model for vLLM compatibility,
+simplifying certain aspects while preserving the core architectural innovations.
+
+The reference implementation can be found in raven_modeling_minimal.py
 """
 
 from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from vllm.attention import Attention
+from vllm.attention.layer import Attention
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -18,11 +21,9 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.compilation.decorators import support_torch_compile  # noqa: F401
 
 
-from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from transformers import PretrainedConfig
@@ -205,19 +206,19 @@ class RavenAttention(nn.Module):
     def _apply_rotary_emb_complex_like(
         self, q: torch.Tensor, k: torch.Tensor, freqs_cis: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.autocast("cuda", enabled=False):
-            # Concatenate q and k on head dimension (dim=1)
-            qk_concat = torch.cat([q, k], dim=1)
-            qk_r2 = qk_concat.unflatten(dim=-1, sizes=(-1, 2)).float()  # cast to float32 for smooth skin
-            rotated_qk_r2 = torch.stack(
-                [
-                    qk_r2[..., 0] * freqs_cis[..., 0] - qk_r2[..., 1] * freqs_cis[..., 1],
-                    qk_r2[..., 1] * freqs_cis[..., 0] + qk_r2[..., 0] * freqs_cis[..., 1],
-                ],
-                -1,
-            ).flatten(-2)
-            q_rotated, k_rotated = torch.split(rotated_qk_r2.type_as(q), q.shape[1], dim=1)
-            return q_rotated, k_rotated
+        # with torch.autocast("cuda", enabled=False):
+        # Concatenate q and k on head dimension (dim=1)
+        qk_concat = torch.cat([q, k], dim=1)
+        qk_r2 = qk_concat.unflatten(dim=-1, sizes=(-1, 2)).float()  # cast to float32 for smooth skin
+        rotated_qk_r2 = torch.stack(
+            [
+                qk_r2[..., 0] * freqs_cis[..., 0] - qk_r2[..., 1] * freqs_cis[..., 1],
+                qk_r2[..., 1] * freqs_cis[..., 0] + qk_r2[..., 0] * freqs_cis[..., 1],
+            ],
+            -1,
+        ).flatten(-2)
+        q_rotated, k_rotated = torch.split(rotated_qk_r2.type_as(q), q.shape[1], dim=1)
+        return q_rotated, k_rotated
 
 
 class RavenMLP(nn.Module):
@@ -349,11 +350,11 @@ class RavenModel(nn.Module):
         dim = self.config.n_embd // self.config.num_attention_heads
         end = self.config.block_size
         theta = self.config.rope_base
-        with torch.autocast("cuda", enabled=False):
-            inv_freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-            t = torch.arange(end, dtype=torch.float32, device=inv_freqs.device)
-            freqs = torch.outer(t, inv_freqs).float()
-            return torch.stack([torch.cos(freqs)[:, None, :], torch.sin(freqs)[:, None, :]], dim=3)
+        # with torch.autocast("cuda", enabled=False):
+        inv_freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        t = torch.arange(end, dtype=torch.float32, device=inv_freqs.device)
+        freqs = torch.outer(t, inv_freqs).float()
+        return torch.stack([torch.cos(freqs)[:, None, :], torch.sin(freqs)[:, None, :]], dim=3)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -437,7 +438,7 @@ class RavenForvLLM(nn.Module):
 
         # Logits processor and sampler
         self.logits_processor = LogitsProcessor(config.vocab_size, config.vocab_size, 1.0)
-        self.sampler = Sampler()
+        # self.sampler = Sampler()
 
     def forward(
         self,
@@ -452,21 +453,16 @@ class RavenForvLLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
-
-    def sample(
-        self,
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
-        return self.sampler(logits, sampling_metadata)
 
     def get_input_embeddings(self) -> nn.Module:
         """Get input embeddings for vLLM compatibility."""
         return self.model.embed_tokens
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights from a state dict."""
