@@ -933,6 +933,38 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             input_embeds = block(input_embeds, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
         return input_embeds, block_idx
 
+    def embed_soft_inputs(
+        self,
+        soft_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Optional[ValidCache] = None,
+        use_cache: bool = False,
+        cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Like embed_inputs, but takes pre-computed embeddings instead of input_ids."""
+        # Support multiple position formats:
+        if position_ids is None and cache_position is None:
+            freqs_cis = self.freqs_cis[:, : soft_embeds.shape[1]]
+        elif position_ids is not None:
+            freqs_cis = self.freqs_cis.index_select(1, position_ids.squeeze())
+        elif cache_position is not None:
+            freqs_cis = self.freqs_cis[:, cache_position]
+
+        prepared_attn_mask = None
+
+        if use_cache and past_key_values is None:
+            past_key_values = HuginnDynamicCache()
+
+        input_embeds = soft_embeds
+        block_idx = torch.tensor(-1, device=torch.device("cpu"), dtype=torch.long)
+        # Non-recurrent prelude
+        for block in self.transformer.prelude:  # type: ignore # types broken in 2.6+
+            block_idx += 1
+            input_embeds = block(input_embeds, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
+        return input_embeds, block_idx
+
     @torch.no_grad()
     def _prefill_with_varied_exit_steps(
         self,
@@ -1255,6 +1287,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         max_diffusion_steps: int = 4096,  # prevent oot for badly configured hyperparam settings
         return_analysis_tablets: bool = False,
         return_full_state_tablet: bool = False,  # make sure to have enough RAM
+        soft_token_mixing: float = 0.0,  # blend factor: 0.0=off (default), 1.0=fully soft embeddings
+        soft_token_top_k: Optional[int] = None,  # override top_k for soft embedding computation
         **model_kwargs,
     ) -> Union[torch.Tensor, dict[str, Any]]:
         """Diffusion-style generation."""
@@ -1287,6 +1321,11 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 state_tablet = input_ids.new_zeros(
                     [*shape, self.config.n_embd], dtype=torch.bfloat16, device=torch.device("cpu")
                 )
+            if soft_token_mixing > 0:
+                soft_entropy_tablet = torch.zeros(shape, device=torch.device("cpu"), dtype=torch.float32)
+
+        prev_logits: Optional[torch.Tensor] = None
+        prev_logits_start: int = 0
 
         if full_prefill:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -1332,7 +1371,44 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             model_inputs = self.prepare_inputs_for_generation(current_sequence, **model_kwargs)
             aux_inputs = dict(past_key_values=kv_cache, cache_position=model_kwargs["cache_position"])
 
-            if ema_embeds > 0.0:
+            # Soft token mixing: blend probability-weighted embeddings with hard token embeddings
+            use_soft_this_step = soft_token_mixing > 0 and prev_logits is not None
+            if use_soft_this_step:
+                # Build generation config override for soft embedding computation
+                soft_gen_config = GenerationConfig(
+                    do_sample=True,
+                    temperature=generation_config.temperature if generation_config.temperature else 1.0,
+                    top_k=soft_token_top_k if soft_token_top_k is not None else generation_config.top_k,
+                    top_p=generation_config.top_p,
+                    min_p=generation_config.min_p,
+                )
+                soft_embeds_raw = self._compute_soft_embeddings(prev_logits, soft_gen_config)
+                if self.emb_scale != 1:
+                    soft_embeds_raw = soft_embeds_raw * self.emb_scale
+
+                # Compute hard embeddings (raw, before prelude)
+                raw_hard_embeds = self.transformer.wte(model_inputs["input_ids"])
+                if self.emb_scale != 1:
+                    raw_hard_embeds = raw_hard_embeds * self.emb_scale
+
+                # Align positions: prev_logits covers [prev_logits_start, ...], current covers [cache_index, ...]
+                overlap_start = max(cache_index, prev_logits_start)
+                overlap_end = min(
+                    cache_index + raw_hard_embeds.shape[1],
+                    prev_logits_start + soft_embeds_raw.shape[1],
+                )
+
+                blended_embeds = raw_hard_embeds.clone()
+                if overlap_end > overlap_start:
+                    hard_slice = slice(overlap_start - cache_index, overlap_end - cache_index)
+                    soft_slice = slice(overlap_start - prev_logits_start, overlap_end - prev_logits_start)
+                    blended_embeds[:, hard_slice, :] = (
+                        (1 - soft_token_mixing) * raw_hard_embeds[:, hard_slice, :]
+                        + soft_token_mixing * soft_embeds_raw[:, soft_slice, :]
+                    )
+
+                embedded_inputs, block_idx = self.embed_soft_inputs(blended_embeds, **aux_inputs)
+            elif ema_embeds > 0.0:
                 new_embeds, block_idx = self.embed_inputs(model_inputs["input_ids"], **aux_inputs)
                 matching_old_embeds = old_embeds[:, cache_index - old_cache_index :]
                 embedded_inputs = new_embeds.clone() * (1 - ema_embeds)
@@ -1340,6 +1416,14 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 old_embeds = embedded_inputs.clone()
             else:
                 embedded_inputs, block_idx = self.embed_inputs(model_inputs["input_ids"], **aux_inputs)
+
+            # EMA blending composes on top of soft mixing (operates on post-prelude embeddings)
+            if use_soft_this_step and ema_embeds > 0.0:
+                matching_old_embeds = old_embeds[:, cache_index - old_cache_index :]
+                embedded_inputs_ema = embedded_inputs.clone() * (1 - ema_embeds)
+                embedded_inputs_ema[:, : matching_old_embeds.shape[1], :] += matching_old_embeds * ema_embeds
+                old_embeds = embedded_inputs_ema.clone()
+                embedded_inputs = embedded_inputs_ema
 
             if state_noise_mixing > 0:
                 rand_states = self.initialize_state(states, scale=init_scale)
@@ -1360,6 +1444,12 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
 
             output = self.predict_from_latents(states, **aux_inputs)
             all_logits: torch.Tensor = output.logits  # type: ignore
+
+            # Store logits for next iteration's soft embedding computation
+            if soft_token_mixing > 0:
+                prev_logits = all_logits.clone()
+                prev_logits_start = cache_index
+
             # remove 1) frozen_tokens, but 2) account for the logit vector being cache_index shorter than
             # the full logits vector, and subtract -1 because we are decoding from the last position as well
             final_logits = all_logits[0, max(frozen_tokens.shape[1] - 1 - cache_index, 0) :, :]  # type: ignore
@@ -1500,6 +1590,13 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 stability_tablet[step] = token_stable_per_position.cpu()
                 if return_full_state_tablet:
                     state_tablet[step, cache_index : cache_index + states.shape[1]] = states[0].cpu()
+                if soft_token_mixing > 0 and prev_logits is not None:
+                    # Compute per-position entropy of soft distribution
+                    soft_probs = F.softmax(prev_logits.float(), dim=-1)
+                    soft_ent = -(soft_probs * (soft_probs + 1e-10).log()).sum(dim=-1)  # [batch, seq]
+                    soft_entropy_tablet[step, prev_logits_start : prev_logits_start + soft_ent.shape[1]] = (
+                        soft_ent[0].cpu()
+                    )
 
             if "latent-acceleration" in freeze_strategy:
                 prev_previous_states = previous_states.clone()
@@ -1523,6 +1620,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                 counter_tablet=counter_tablet,  # .repeat_interleave(inner_recurrence, dim=0),
                 stability_tablet=stability_tablet,  # .repeat_interleave(inner_recurrence, dim=0),
                 state_tablet=state_tablet if return_full_state_tablet else None,
+                soft_entropy_tablet=soft_entropy_tablet if soft_token_mixing > 0 else None,
             )
 
         summary_scores = {
@@ -1987,6 +2085,48 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             return torch.multinomial(probs, num_samples=1)
         else:
             return torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+    def _compute_soft_embeddings(self, logits: torch.Tensor, generation_config: GenerationConfig) -> torch.Tensor:
+        """Compute probability-weighted soft embeddings from logits.
+
+        Takes logits [batch, seq, vocab], applies the same temperature + filtering as _sample_next_token,
+        then returns probs @ wte.weight → [batch, seq, n_embd].
+        """
+        logits = logits.to(copy=True, dtype=torch.float32)
+        temperature = generation_config.temperature if generation_config.temperature else 1.0
+        logits = logits / temperature
+
+        probs = F.softmax(logits, dim=-1)
+
+        # Apply top_k
+        if generation_config.top_k:
+            top_k_values, _ = torch.topk(probs, generation_config.top_k, dim=-1)
+            min_values = top_k_values[..., -1:].expand_as(probs)
+            probs = torch.where(probs < min_values, torch.zeros_like(probs), probs)
+
+        # Apply top_p (nucleus filtering)
+        if generation_config.top_p:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            remove_mask = cumulative_probs > generation_config.top_p
+            remove_mask[..., 0] = False  # keep at least top probability
+            sorted_probs[remove_mask] = 0.0
+            # Scatter back to original order
+            probs = torch.zeros_like(probs).scatter(-1, sorted_indices, sorted_probs)
+
+        # Apply min_p
+        if generation_config.min_p:
+            max_probs = probs.max(dim=-1, keepdim=True)[0]
+            min_p_threshold = generation_config.min_p * max_probs
+            probs = torch.where(probs < min_p_threshold, torch.zeros_like(probs), probs)
+
+        # Renormalize
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+
+        # Compute soft embeddings: probs @ wte.weight → [batch, seq, n_embd]
+        wte_weight = self.get_input_embeddings().weight.to(dtype=probs.dtype)  # [vocab, n_embd]
+        soft_embeds = torch.matmul(probs, wte_weight)  # [batch, seq, n_embd]
+        return soft_embeds.to(dtype=logits.dtype)
 
     def _apply_repetition_penalty(self, original_logits, input_ids, generation_config, use_candidates=False):
         # Determine the actual structure
