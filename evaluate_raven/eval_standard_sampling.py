@@ -59,6 +59,7 @@ def run_evaluation(
     model_name: str = "tomg-group-umd/huginn-0125",
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu",
     max_new_tokens: int = 128,
+    num_steps: int = 4,
     prompt_categories: list[str] = ["reasoning", "factual", "creative"],
     output_file: Optional[str] = None,
     temperature: float = 0.7,
@@ -71,6 +72,7 @@ def run_evaluation(
         model_name: HuggingFace model identifier.
         device: Device to run on.
         max_new_tokens: Maximum tokens to generate per prompt.
+        num_steps: Number of recurrence iterations per token.
         prompt_categories: Which prompt categories to test.
         output_file: Path to write JSON results.
         temperature: Sampling temperature.
@@ -118,6 +120,7 @@ def run_evaluation(
                 generation_config=generation_config,
                 tokenizer=tokenizer,
                 continuous_compute=True,
+                num_steps=num_steps,
             )
 
             sequences = output.sequences if hasattr(output, "sequences") else output
