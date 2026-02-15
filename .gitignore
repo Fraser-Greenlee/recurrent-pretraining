@@ -48,3 +48,4 @@ huginn_raven_test_upload/
 *.safetensors
 *.log
 *.pdf
+logs

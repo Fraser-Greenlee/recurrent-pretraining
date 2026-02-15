@@ -12,7 +12,8 @@ from typing import Optional
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+from transformers import AutoTokenizer, GenerationConfig
+from recpre.raven_modeling_minimal import RavenForCausalLM
 from jsonargparse import CLI
 
 # Same prompts as eval_soft_embeddings.py
@@ -66,10 +67,9 @@ def run_evaluation(
 
     print(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = RavenForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
     ).to(torch_device)
     model.eval()
 
