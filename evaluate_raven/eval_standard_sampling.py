@@ -17,13 +17,16 @@ from importlib.util import spec_from_file_location, module_from_spec
 from jsonargparse import CLI
 
 # Load raven_modeling_minimal directly to avoid pulling in training deps via recpre.__init__
-_config_spec = spec_from_file_location("raven_config_minimal", wd / "recpre" / "raven_config_minimal.py")
+_config_spec = spec_from_file_location("recpre.raven_config_minimal", wd / "recpre" / "raven_config_minimal.py")
 _config_mod = module_from_spec(_config_spec)
+_config_mod.__package__ = "recpre"
 sys.modules["recpre.raven_config_minimal"] = _config_mod
 _config_spec.loader.exec_module(_config_mod)
 
-_model_spec = spec_from_file_location("raven_modeling_minimal", wd / "recpre" / "raven_modeling_minimal.py")
+_model_spec = spec_from_file_location("recpre.raven_modeling_minimal", wd / "recpre" / "raven_modeling_minimal.py")
 _model_mod = module_from_spec(_model_spec)
+_model_mod.__package__ = "recpre"
+sys.modules["recpre.raven_modeling_minimal"] = _model_mod
 _model_spec.loader.exec_module(_model_mod)
 RavenForCausalLM = _model_mod.RavenForCausalLM
 
