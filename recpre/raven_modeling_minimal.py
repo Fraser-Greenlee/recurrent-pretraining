@@ -1173,6 +1173,8 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             max_new_tokens = model_kwargs["max_new_tokens"]
             if "max_length" in model_kwargs:
                 max_new_tokens = min(max_new_tokens, model_kwargs["max_length"] - input_ids.shape[1])
+        elif generation_config.max_new_tokens is not None:
+            max_new_tokens = generation_config.max_new_tokens
         else:
             max_length = model_kwargs.get("max_length", generation_config.max_length)
             max_new_tokens = max_length - input_ids.shape[1]
