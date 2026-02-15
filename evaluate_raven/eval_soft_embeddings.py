@@ -3,6 +3,7 @@
 Compares generation quality and convergence with varying soft_token_mixing values.
 """
 
+import time
 import torch
 import json
 import sys
@@ -129,6 +130,9 @@ def run_evaluation(
             for mixing in mixing_values:
                 print(f"\n  soft_token_mixing={mixing:.2f}")
 
+                torch.cuda.synchronize(torch_device)
+                t0 = time.perf_counter()
+
                 output = model.generate_diffusion_style(
                     input_ids,
                     generation_config=generation_config,
@@ -142,17 +146,26 @@ def run_evaluation(
                     return_analysis_tablets=True,
                 )
 
+                torch.cuda.synchronize(torch_device)
+                t1 = time.perf_counter()
+
                 sequences = output.sequences
                 summary = output.scores
                 analysis = output.hidden_states
 
                 generated_text = tokenizer.decode(sequences[0, input_ids.shape[1]:], skip_special_tokens=True)
+                num_tokens = sequences.shape[1] - input_ids.shape[1]
+                wall_time = t1 - t0
+                tokens_per_sec = num_tokens / wall_time if wall_time > 0 else 0
                 print(f"    Generated: {generated_text[:120]}...")
 
                 # Extract metrics
                 recurrence_per_pos = summary["recurrence_per_position"]
                 entry = {
                     "generated_text": generated_text,
+                    "num_tokens_generated": num_tokens,
+                    "wall_time_s": round(wall_time, 3),
+                    "tokens_per_sec": round(tokens_per_sec, 2),
                     "diffusion_steps": summary["diffusion_steps"],
                     "num_core_forward_passes": summary["num_core_forward_passes"],
                     "num_tokens_forward": summary["num_tokens_forward"],
@@ -178,7 +191,9 @@ def run_evaluation(
 
                 print(f"    Steps: {entry['diffusion_steps']}, "
                       f"Passes: {entry['num_core_forward_passes']}, "
-                      f"Mean recurrence: {entry['mean_recurrence']:.1f}")
+                      f"Mean recurrence: {entry['mean_recurrence']:.1f}, "
+                      f"Time: {entry['wall_time_s']}s, "
+                      f"Tok/s: {entry['tokens_per_sec']}")
                 if "mean_soft_entropy" in entry:
                     print(f"    Soft entropy: mean={entry['mean_soft_entropy']:.3f}, "
                           f"max={entry['max_soft_entropy']:.3f}")

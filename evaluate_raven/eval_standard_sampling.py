@@ -1,8 +1,10 @@
 """Evaluate standard autoregressive sampling (no wavefront/diffusion).
 
-Baseline comparison for diffusion-style and soft embedding generation.
+Uses generate_diffusion_style with max_wavefront=1 to get true token-by-token
+generation with a fixed number of recurrence iterations per token.
 """
 
+import time
 import torch
 import json
 import sys
@@ -59,7 +61,8 @@ def run_evaluation(
     model_name: str = "tomg-group-umd/huginn-0125",
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu",
     max_new_tokens: int = 128,
-    num_steps: int = 4,
+    num_steps: int = 32,
+    inner_recurrence: int = 4,
     prompt_categories: list[str] = ["reasoning", "factual", "creative"],
     output_file: Optional[str] = None,
     temperature: float = 0.7,
@@ -68,11 +71,15 @@ def run_evaluation(
 ):
     """Run standard autoregressive sampling evaluation (no wavefront/diffusion).
 
+    Uses generate_diffusion_style with max_wavefront=1 and headway=1 so that
+    tokens are generated one at a time with a fixed recurrence budget.
+
     Args:
         model_name: HuggingFace model identifier.
         device: Device to run on.
         max_new_tokens: Maximum tokens to generate per prompt.
-        num_steps: Number of recurrence iterations per token.
+        num_steps: Number of outer diffusion steps (controls total recurrence budget).
+        inner_recurrence: Number of core block iterations per diffusion step.
         prompt_categories: Which prompt categories to test.
         output_file: Path to write JSON results.
         temperature: Sampling temperature.
@@ -82,6 +89,8 @@ def run_evaluation(
     torch_device = torch.device(device)
 
     print(f"Loading model: {model_name}")
+    print(f"Config: num_steps={num_steps}, inner_recurrence={inner_recurrence}, "
+          f"max_wavefront=1 (standard autoregressive)")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = RavenForCausalLM.from_pretrained(
         model_name,
@@ -115,34 +124,76 @@ def run_evaluation(
 
             input_ids = tokenizer.encode(prompt, return_tensors="pt").to(torch_device)
 
-            output = model.generate_minimal(
+            torch.cuda.synchronize(torch_device)
+            t0 = time.perf_counter()
+
+            output = model.generate_diffusion_style(
                 input_ids,
                 generation_config=generation_config,
                 tokenizer=tokenizer,
-                continuous_compute=True,
                 num_steps=num_steps,
+                inner_recurrence=inner_recurrence,
+                max_wavefront=1,
+                headway=1,
+                return_analysis_tablets=True,
             )
 
-            sequences = output.sequences if hasattr(output, "sequences") else output
-            generated_text = tokenizer.decode(sequences[0, input_ids.shape[1]:], skip_special_tokens=True)
-            print(f"  Generated: {generated_text[:120]}...")
+            torch.cuda.synchronize(torch_device)
+            t1 = time.perf_counter()
 
-            results[category][prompt] = {
+            sequences = output.sequences
+            summary = output.scores
+            generated_text = tokenizer.decode(sequences[0, input_ids.shape[1]:], skip_special_tokens=True)
+            num_tokens = sequences.shape[1] - input_ids.shape[1]
+            wall_time = t1 - t0
+            tokens_per_sec = num_tokens / wall_time if wall_time > 0 else 0
+
+            print(f"  Generated: {generated_text[:120]}...")
+            print(f"  Tokens: {num_tokens}, Time: {wall_time:.2f}s, "
+                  f"Tokens/s: {tokens_per_sec:.1f}")
+            print(f"  Forward passes: {summary['num_core_forward_passes']}, "
+                  f"Tokens forwarded: {summary['num_tokens_forward']}")
+
+            recurrence_per_pos = summary["recurrence_per_position"]
+            entry = {
                 "generated_text": generated_text,
-                "num_tokens_generated": sequences.shape[1] - input_ids.shape[1],
+                "num_tokens_generated": num_tokens,
+                "wall_time_s": round(wall_time, 3),
+                "tokens_per_sec": round(tokens_per_sec, 2),
+                "num_core_forward_passes": summary["num_core_forward_passes"],
+                "num_tokens_forward": summary["num_tokens_forward"],
+                "num_cache_clears": summary["num_cache_clears"],
+                "diffusion_steps": summary["diffusion_steps"],
+                "mean_recurrence": float(recurrence_per_pos.float().mean()),
+                "max_recurrence": int(recurrence_per_pos.max()),
             }
+
+            results[category][prompt] = entry
 
     # Print summary
     print(f"\n{'='*80}")
     print("SUMMARY")
     print(f"{'='*80}")
+    all_tok_per_sec = []
+    all_forward_passes = []
     for category in results:
         print(f"\n--- {category.upper()} ---")
         for prompt in results[category]:
             entry = results[category][prompt]
+            all_tok_per_sec.append(entry["tokens_per_sec"])
+            all_forward_passes.append(entry["num_core_forward_passes"])
             print(f"\nPrompt: {prompt[:60]}...")
-            print(f"  Tokens: {entry['num_tokens_generated']}")
+            print(f"  Tokens: {entry['num_tokens_generated']}, "
+                  f"Time: {entry['wall_time_s']}s, "
+                  f"Tok/s: {entry['tokens_per_sec']}")
+            print(f"  Forward passes: {entry['num_core_forward_passes']}, "
+                  f"Mean recurrence: {entry['mean_recurrence']:.1f}")
             print(f"  Output: {entry['generated_text'][:100]}...")
+
+    if all_tok_per_sec:
+        print(f"\n--- AGGREGATE ---")
+        print(f"  Mean tokens/s: {sum(all_tok_per_sec)/len(all_tok_per_sec):.1f}")
+        print(f"  Mean forward passes: {sum(all_forward_passes)/len(all_forward_passes):.0f}")
 
     if output_file:
         with open(output_file, "w") as f:
