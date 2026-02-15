@@ -93,6 +93,7 @@ def run_evaluation(
         top_k=top_k,
         top_p=top_p,
         max_new_tokens=max_new_tokens,
+        return_dict_in_generate=True,
     )
 
     results = {}
@@ -112,17 +113,20 @@ def run_evaluation(
 
             input_ids = tokenizer.encode(prompt, return_tensors="pt").to(torch_device)
 
-            output = model.generate(
+            output = model.generate_minimal(
                 input_ids,
                 generation_config=generation_config,
+                tokenizer=tokenizer,
+                continuous_compute=True,
             )
 
-            generated_text = tokenizer.decode(output[0, input_ids.shape[1]:], skip_special_tokens=True)
+            sequences = output.sequences if hasattr(output, "sequences") else output
+            generated_text = tokenizer.decode(sequences[0, input_ids.shape[1]:], skip_special_tokens=True)
             print(f"  Generated: {generated_text[:120]}...")
 
             results[category][prompt] = {
                 "generated_text": generated_text,
-                "num_tokens_generated": output.shape[1] - input_ids.shape[1],
+                "num_tokens_generated": sequences.shape[1] - input_ids.shape[1],
             }
 
     # Print summary

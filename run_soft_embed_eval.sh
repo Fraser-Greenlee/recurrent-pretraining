@@ -9,6 +9,7 @@
 #SBATCH --time=1:00:00
 
 source .venv/bin/activate
+mkdir -p logs results
 
 python evaluate_raven/eval_soft_embeddings.py \
   --model_name tomg-group-umd/huginn-0125 \
