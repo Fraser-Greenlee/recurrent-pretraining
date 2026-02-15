@@ -1392,7 +1392,9 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
                     raw_hard_embeds = raw_hard_embeds * self.emb_scale
 
                 # Align positions: prev_logits covers [prev_logits_start, ...], current covers [cache_index, ...]
-                overlap_start = max(cache_index, prev_logits_start)
+                # Only blend predicted tokens, never prompt tokens
+                prompt_len = input_ids.shape[1]
+                overlap_start = max(cache_index, prev_logits_start, prompt_len)
                 overlap_end = min(
                     cache_index + raw_hard_embeds.shape[1],
                     prev_logits_start + soft_embeds_raw.shape[1],
